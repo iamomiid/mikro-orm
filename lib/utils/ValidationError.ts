@@ -38,7 +38,7 @@ export class ValidationError<T extends AnyEntity = AnyEntity> extends Error {
     return new ValidationError(`${meta.className} entity is missing @PrimaryKey()`);
   }
 
-  // TODO add hint about possibly not discovered entity
+  // TODO add hint about possibly not discovered entity in case of `prop.type` or `owner.type` is undefined
   static fromWrongReference(meta: EntityMetadata, prop: EntityProperty, key: keyof EntityProperty, owner?: EntityProperty): ValidationError {
     if (owner) {
       return ValidationError.fromMessage(meta, prop, `has wrong '${key}' reference type: ${owner.type} instead of ${meta.className}`);
@@ -162,6 +162,10 @@ export class ValidationError<T extends AnyEntity = AnyEntity> extends Error {
       + `Consider working with the owning side instead (${ownerCollection}).`;
 
     return  new ValidationError(error, owner);
+  }
+
+  static invalidCompositeIdentifier(): ValidationError {
+    return new ValidationError('Binding an entity with a composite primary key to a query is not supported. You should split the parameter into the explicit fields and bind them separately.');
   }
 
   private static fromMessage(meta: EntityMetadata, prop: EntityProperty, message: string): ValidationError {

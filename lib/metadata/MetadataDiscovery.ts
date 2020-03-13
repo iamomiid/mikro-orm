@@ -33,8 +33,13 @@ export class MetadataDiscovery {
     // ignore base entities (not annotated with @Entity)
     const filtered = this.discovered.filter(meta => meta.name);
     filtered.forEach(meta => this.defineBaseEntityProperties(meta));
+    filtered.forEach(meta => this.metadata.set(meta.className, new EntitySchema(meta, true).init().meta));
+    filtered.forEach(meta => this.defineBaseEntityProperties(meta));
     filtered.forEach(meta => Object.values(meta.properties).forEach(prop => this.initFactoryField(prop)));
     filtered.forEach(meta => Object.values(meta.properties).forEach(prop => this.initFieldName(prop)));
+    filtered.forEach(meta => Object.values(meta.properties).forEach(prop => this.initVersionProperty(meta, prop)));
+    filtered.forEach(meta => Object.values(meta.properties).forEach(prop => this.initCustomType(prop)));
+    filtered.forEach(meta => Object.values(meta.properties).forEach(prop => this.initColumnType(prop, meta.path)));
     filtered.forEach(meta => Object.values(meta.properties).forEach(prop => this.initUnsigned(prop)));
     filtered.forEach(meta => this.autoWireBidirectionalProperties(meta));
     filtered.forEach(meta => this.discovered.push(...this.processEntity(meta)));
@@ -169,7 +174,23 @@ export class MetadataDiscovery {
   }
 
   private applyNamingStrategy(meta: EntityMetadata, prop: EntityProperty): void {
-    if (!prop.fieldName) {
+    if (prop.fieldName && !prop.fieldNames) {
+      prop.fieldNames = [prop.fieldName];
+    }
+
+    if (prop.joinColumn && !prop.joinColumns) {
+      prop.joinColumns = [prop.joinColumn];
+    }
+
+    if (prop.inverseJoinColumn && !prop.inverseJoinColumns) {
+      prop.inverseJoinColumns = [prop.inverseJoinColumn];
+    }
+
+    if (prop.referenceColumnName && !prop.referencedColumnNames) {
+      prop.referencedColumnNames = [prop.referenceColumnName];
+    }
+
+    if (!prop.fieldNames) {
       this.initFieldName(prop);
     }
 
@@ -177,39 +198,56 @@ export class MetadataDiscovery {
       this.initManyToManyFields(meta, prop);
     }
 
-    if (prop.reference === ReferenceType.ONE_TO_MANY || prop.reference === ReferenceType.ONE_TO_ONE) {
-      this.initOneToManyFields(meta, prop);
+    if ([ReferenceType.MANY_TO_ONE, ReferenceType.ONE_TO_ONE].includes(prop.reference)) {
+      this.initManyToOneFields(prop);
+    }
+
+    if (prop.reference === ReferenceType.ONE_TO_MANY) {
+      this.initOneToManyFields(prop);
     }
   }
 
   private initFieldName(prop: EntityProperty): void {
-    if (prop.fieldName) {
+    if (prop.fieldName && !prop.fieldNames) {
+      prop.fieldNames = [prop.fieldName];
+    }
+
+    if (prop.fieldNames && prop.fieldNames.length > 0) {
       return;
     }
 
     if (prop.reference === ReferenceType.SCALAR) {
-      prop.fieldName = this.namingStrategy.propertyToColumnName(prop.name);
+      prop.fieldNames = [this.namingStrategy.propertyToColumnName(prop.name)];
     } else if ([ReferenceType.MANY_TO_ONE, ReferenceType.ONE_TO_ONE].includes(prop.reference)) {
-      prop.fieldName = this.initManyToOneFieldName(prop, prop.name);
+      prop.fieldNames = this.initManyToOneFieldName(prop, prop.name);
     } else if (prop.reference === ReferenceType.MANY_TO_MANY && prop.owner) {
-      prop.fieldName = this.namingStrategy.propertyToColumnName(prop.name);
+      prop.fieldNames = this.initManyToManyFieldName(prop, prop.name);
     }
   }
 
-  private initManyToOneFieldName(prop: EntityProperty, name: string): string {
+  private initManyToOneFieldName(prop: EntityProperty, name: string): string[] {
     const meta2 = this.metadata.get(prop.type);
-    const referenceColumnName = meta2.properties[meta2.primaryKey].fieldName;
+    const ret: string[] = [];
 
-    return this.namingStrategy.joinKeyColumnName(name, referenceColumnName);
+    for (const primaryKey of meta2.primaryKeys) {
+      this.initFieldName(meta2.properties[primaryKey]);
+
+      for (const fieldName of meta2.properties[primaryKey].fieldNames) {
+        ret.push(this.namingStrategy.joinKeyColumnName(name, fieldName));
+      }
+    }
+
+    return ret;
+  }
+
+  private initManyToManyFieldName(prop: EntityProperty, name: string): string[] {
+    const meta2 = this.metadata.get(prop.type);
+    return meta2.primaryKeys.map(() => this.namingStrategy.propertyToColumnName(name));
   }
 
   private initManyToManyFields(meta: EntityMetadata, prop: EntityProperty): void {
     const meta2 = this.metadata.get(prop.type);
     Utils.defaultValue(prop, 'fixedOrder', !!prop.fixedOrderColumn);
-
-    if (!prop.owner && !prop.inversedBy && !prop.mappedBy) {
-      prop.owner = true;
-    }
 
     if (!prop.pivotTable && prop.owner) {
       prop.pivotTable = this.namingStrategy.joinTableName(meta.collection, meta2.collection, prop.name);
@@ -223,31 +261,54 @@ export class MetadataDiscovery {
       prop.fixedOrderColumn = prop2.fixedOrderColumn;
     }
 
-    if (!prop.referenceColumnName) {
-      prop.referenceColumnName = meta.properties[meta.primaryKey].fieldName;
+    if (!prop.referencedColumnNames || prop.referencedColumnNames.length === 0) {
+      prop.referencedColumnNames = meta.primaryKeys.map(primaryKey => meta.properties[primaryKey].fieldNames[0]); // TODO use fieldNames and flatten the array?
     }
 
-    if (!prop.inverseJoinColumn) {
+    if (!prop.joinColumns || prop.joinColumns.length === 0) {
+      prop.joinColumns = prop.referencedColumnNames.map(referencedColumnName => this.namingStrategy.joinKeyColumnName(meta.collection, referencedColumnName));
+    }
+
+    if (!prop.inverseJoinColumns || prop.inverseJoinColumns.length === 0) {
       const meta2 = this.metadata.get(prop.type);
-      prop.inverseJoinColumn = this.initManyToOneFieldName(prop, meta2.collection);
-    }
-
-    if (!prop.joinColumn) {
-      prop.joinColumn = this.namingStrategy.joinKeyColumnName(meta.collection, prop.referenceColumnName);
+      prop.inverseJoinColumns = this.initManyToOneFieldName(prop, meta2.collection);
     }
   }
 
-  private initOneToManyFields(meta: EntityMetadata, prop: EntityProperty): void {
-    if (!prop.joinColumn) {
-      prop.joinColumn = this.namingStrategy.joinColumnName(prop.name);
+  private initManyToOneFields(prop: EntityProperty): void {
+    if (prop.joinColumn || prop.joinColumns) {
+      return;
     }
 
-    if (prop.reference === ReferenceType.ONE_TO_ONE && !prop.inverseJoinColumn && prop.mappedBy) {
-      prop.inverseJoinColumn = this.metadata.get(prop.type).properties[prop.mappedBy].fieldName;
+    const meta2 = this.metadata.get(prop.type);
+    prop.joinColumns = [];
+    prop.referencedColumnNames = [];
+
+    for (const primaryKey of meta2.primaryKeys) {
+      const prop2 = meta2.properties[primaryKey];
+
+      for (const fieldName of prop2.fieldNames) {
+        prop.joinColumns.push(this.namingStrategy.joinKeyColumnName(prop.name, fieldName));
+        prop.referencedColumnNames.push(fieldName);
+      }
+    }
+  }
+
+  private initOneToManyFields(prop: EntityProperty): void {
+    if (prop.joinColumn || prop.joinColumns) {
+      return;
     }
 
-    if (!prop.referenceColumnName) {
-      prop.referenceColumnName = meta.properties[meta.primaryKey].fieldName;
+    const meta2 = this.metadata.get(prop.type);
+    prop.joinColumns = [this.namingStrategy.joinColumnName(prop.name)];
+    prop.referencedColumnNames = [];
+
+    for (const primaryKey of meta2.primaryKeys) {
+      const prop2 = meta2.properties[primaryKey];
+
+      for (const fieldName of prop2.fieldNames) {
+        prop.referencedColumnNames.push(fieldName);
+      }
     }
   }
 
@@ -290,7 +351,7 @@ export class MetadataDiscovery {
 
       if (value instanceof Function) {
         const meta2 = this.metadata.get(prop.type);
-        prop[type] = value(meta2.properties as any).name;
+        prop[type] = value(meta2.properties).name;
       }
     });
   }
@@ -309,21 +370,21 @@ export class MetadataDiscovery {
     if (prop.fixedOrder) {
       const primaryProp = this.defineFixedOrderProperty(prop);
       data.properties[primaryProp.name] = primaryProp;
-      data.primaryKey = primaryProp.name;
+      data.primaryKeys = [primaryProp.name];
     } else {
       data.primaryKeys = [meta.name + '_owner', prop.type + '_inverse'];
       data.compositePK = true;
     }
 
     // handle self-referenced m:n with same default field names
-    if (meta.name === prop.type && prop.joinColumn === prop.inverseJoinColumn) {
-      prop.joinColumn = this.namingStrategy.joinKeyColumnName(meta.collection + '_1', prop.referenceColumnName);
-      prop.inverseJoinColumn = this.namingStrategy.joinKeyColumnName(meta.collection + '_2', prop.referenceColumnName);
+    if (meta.name === prop.type && prop.joinColumns.every((joinColumn, idx) => joinColumn === prop.inverseJoinColumns[idx])) {
+      prop.joinColumns = prop.referencedColumnNames.map(name => this.namingStrategy.joinKeyColumnName(meta.collection + '_1', name));
+      prop.inverseJoinColumns = prop.referencedColumnNames.map(name => this.namingStrategy.joinKeyColumnName(meta.collection + '_2', name));
 
       if (prop.inversedBy) {
         const prop2 = this.metadata.get(prop.type).properties[prop.inversedBy];
-        prop2.inverseJoinColumn = prop.joinColumn;
-        prop2.joinColumn = prop.inverseJoinColumn;
+        prop2.inverseJoinColumns = prop.joinColumns;
+        prop2.joinColumns = prop.inverseJoinColumns;
       }
     }
 
@@ -366,20 +427,43 @@ export class MetadataDiscovery {
       fixedOrderColumn: prop.fixedOrderColumn,
     } as EntityProperty;
 
+    ret.joinColumns = [];
+    ret.inverseJoinColumns = [];
+
     if (owner) {
       ret.owner = true;
       ret.inversedBy = inverse;
-      ret.referenceColumnName = prop.referenceColumnName;
-      ret.fieldName = ret.joinColumn = prop.joinColumn;
-      ret.inverseJoinColumn = prop.referenceColumnName;
+      ret.referencedColumnNames = prop.referencedColumnNames;
+      ret.fieldNames = ret.joinColumns = prop.joinColumns;
+      ret.inverseJoinColumns = prop.referencedColumnNames;
     } else {
       const meta = this.metadata.get(type);
-      const prop2 = meta.properties[meta.primaryKey];
       ret.owner = false;
       ret.mappedBy = inverse;
-      ret.referenceColumnName = prop2.fieldName;
-      ret.fieldName = ret.joinColumn = prop.inverseJoinColumn;
-      ret.inverseJoinColumn = prop2.fieldName;
+      ret.fieldNames = ret.joinColumns = prop.inverseJoinColumns;
+      ret.referencedColumnNames = [];
+      ret.inverseJoinColumns = [];
+      meta.primaryKeys.forEach(primaryKey => {
+        const prop2 = meta.properties[primaryKey];
+        ret.referencedColumnNames.push(...prop2.fieldNames);
+        ret.inverseJoinColumns.push(...prop2.fieldNames);
+      });
+    }
+
+    if (ret.fieldNames) {
+      ret.fieldName = ret.fieldNames[0];
+    }
+
+    if (ret.joinColumns) {
+      ret.joinColumn = ret.joinColumns[0];
+    }
+
+    if (ret.inverseJoinColumns) {
+      ret.inverseJoinColumn = ret.inverseJoinColumns[0];
+    }
+
+    if (ret.referencedColumnNames) {
+      ret.referenceColumnName = ret.referencedColumnNames[0];
     }
 
     this.initColumnType(ret);
@@ -450,12 +534,12 @@ export class MetadataDiscovery {
 
     if (prop.customType) {
       prop.type = prop.customType.constructor.name;
-      prop.columnType = prop.customType.getColumnType(prop, this.platform);
+      prop.columnTypes = [prop.customType.getColumnType(prop, this.platform)];
     }
   }
 
   private initColumnType(prop: EntityProperty, path?: string): void {
-    if (prop.columnType || !this.schemaHelper) {
+    if (prop.columnTypes || !this.schemaHelper) {
       return;
     }
 
@@ -464,20 +548,23 @@ export class MetadataDiscovery {
     }
 
     if (prop.reference === ReferenceType.SCALAR) {
-      prop.columnType = this.schemaHelper.getTypeDefinition(prop);
+      prop.columnTypes = [this.schemaHelper.getTypeDefinition(prop)];
       return;
     }
 
     const meta = this.metadata.get(prop.type);
-    const pk = meta.properties[meta.primaryKey];
-    this.initCustomType(pk);
+    prop.columnTypes = [];
+    meta.primaryKeys.forEach(primaryKey => {
+      const pk = meta.properties[primaryKey];
+      this.initCustomType(pk);
 
-    if (pk.customType) {
-      prop.columnType = pk.customType.getColumnType(pk, this.platform);
-      return;
-    }
+      if (pk.customType) {
+        prop.columnTypes.push(pk.customType.getColumnType(pk, this.platform));
+        return;
+      }
 
-    prop.columnType = this.schemaHelper.getTypeDefinition(pk);
+      prop.columnTypes.push(this.schemaHelper!.getTypeDefinition(pk));
+    });
   }
 
   private initEnumValues(prop: EntityProperty, path: string): void {
@@ -490,16 +577,21 @@ export class MetadataDiscovery {
       Utils.defaultValue(prop, 'items', items);
     }
 
-    prop.columnType = this.schemaHelper!.getTypeDefinition(prop);
+    prop.columnTypes = [this.schemaHelper!.getTypeDefinition(prop)];
   }
 
   private initUnsigned(prop: EntityProperty): void {
     if (prop.reference === ReferenceType.MANY_TO_ONE || prop.reference === ReferenceType.ONE_TO_ONE) {
       const meta2 = this.metadata.get(prop.type);
-      const pk = meta2.properties[meta2.primaryKey];
-      prop.unsigned = pk.type === 'number' || this.platform.isBigIntProperty(pk);
-      prop.referenceColumnName = pk.fieldName;
-      prop.referencedTableName = meta2.collection;
+      prop.referencedColumnNames = [];
+
+      meta2.primaryKeys.forEach(primaryKey => {
+        const pk = meta2.properties[primaryKey];
+        prop.unsigned = pk.type === 'number' || this.platform.isBigIntProperty(pk);
+        prop.referenceColumnName = pk.fieldNames[0];
+        prop.referencedColumnNames.push(pk.fieldNames[0]);
+        prop.referencedTableName = meta2.collection;
+      });
 
       return;
     }

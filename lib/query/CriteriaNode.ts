@@ -24,11 +24,13 @@ export class CriteriaNode {
     const meta = parent && metadata.get(parent.entityName, false, false);
 
     if (meta && key) {
-      this.prop = meta.properties[key];
+      Utils.splitPrimaryKeys(key).forEach(k => {
+        this.prop = meta.properties[k];
 
-      if (validate && !this.prop && !key.includes('.') && !QueryBuilderHelper.isOperator(key) && !QueryBuilderHelper.isCustomExpression(key)) {
-        throw new Error(`Trying to query by not existing property ${entityName}.${key}`);
-      }
+        if (validate && !this.prop && !k.includes('.') && !QueryBuilderHelper.isOperator(k) && !QueryBuilderHelper.isCustomExpression(k)) {
+          throw new Error(`Trying to query by not existing property ${entityName}.${k}`);
+        }
+      });
     }
   }
 
@@ -75,14 +77,14 @@ export class CriteriaNode {
       const pivotTable = this.prop!.pivotTable;
       const alias = qb.getAliasForEntity(pivotTable, this);
 
-      return `${alias}.${this.prop!.inverseJoinColumn}`;
+      return `${alias}.${this.prop!.inverseJoinColumns[0]}`; // FIXME?
     }
 
     const meta = this.metadata.get(this.prop!.type);
     const alias = qb.getAliasForEntity(meta.name, this);
-    const pk = meta.properties[meta.primaryKey];
+    const pk = meta.properties[meta.primaryKeys[0]]; // FIXME?
 
-    return `${alias}.${pk.fieldName}`;
+    return `${alias}.${pk.fieldNames[0]}`; // FIXME?
   }
 
   getPath(): string {

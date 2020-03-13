@@ -77,7 +77,7 @@ export class SmartQueryHelper {
       return entity.__primaryKey;
     }
 
-    return { [entity.__primaryKeyField]: entity.__primaryKey };
+    return Utils.getPrimaryKeyCond(entity, wrap(entity).__meta.primaryKeys);
   }
 
   private static processExpression<T>(expr: string, value: T): Dictionary<T> {

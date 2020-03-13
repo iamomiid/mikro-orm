@@ -1,6 +1,7 @@
 import { ColumnBuilder, SchemaBuilder, TableBuilder } from 'knex';
-import { AbstractSqlDriver, Cascade, Configuration, DatabaseSchema, IsSame, ReferenceType, Utils } from '..';
+import { AbstractSqlDriver, Cascade, Configuration, DatabaseSchema, IsSame, ReferenceType } from '..';
 import { EntityMetadata, EntityProperty } from '../typings';
+import { Utils } from '../utils';
 import { Platform } from '../platforms';
 import { MetadataStorage } from '../metadata';
 import { Column, DatabaseTable } from './DatabaseTable';
@@ -165,19 +166,30 @@ export class SchemaGenerator {
       Object
         .values(meta.properties)
         .filter(prop => this.shouldHaveColumn(meta, prop))
-        .forEach(prop => this.createTableColumn(table, meta, prop));
+        .forEach(prop => {
+          if (prop.reference === ReferenceType.SCALAR) {
+            this.createTableColumn(table, meta, prop);
+          } else {
+            const meta2 = this.metadata.get(prop.type);
+            meta2.primaryKeys.forEach((pk, idx) => {
+              const columnName = prop.joinColumns ? prop.joinColumns[idx] : prop.fieldNames[idx];
+              const col = table.specificType(columnName, meta2.properties[pk].columnTypes[0]);
+              this.configureColumn(meta, prop, col, meta2.properties[pk]);
+            });
+          }
+        });
 
       if (meta.compositePK) {
-        table.primary(meta.primaryKeys.map(prop => meta.properties[prop].fieldName));
+        table.primary(Utils.flatten(meta.primaryKeys.map(prop => meta.properties[prop].fieldNames)));
       }
 
       meta.indexes.forEach(index => {
-        const properties = Utils.asArray(index.properties).map(prop => meta.properties[prop].fieldName);
+        const properties = Utils.flatten(Utils.asArray(index.properties).map(prop => meta.properties[prop].fieldNames));
         table.index(properties, index.name, index.type);
       });
 
       meta.uniques.forEach(index => {
-        const properties = Utils.asArray(index.properties).map(prop => meta.properties[prop].fieldName);
+        const properties = Utils.flatten(Utils.asArray(index.properties).map(prop => meta.properties[prop].fieldNames));
         table.unique(properties, index.name);
       });
 
@@ -221,25 +233,33 @@ export class SchemaGenerator {
     const columns = table.getColumns();
     const create: EntityProperty[] = [];
     const update: { prop: EntityProperty; column: Column; diff: IsSame }[] = [];
-    const remove = columns.filter(col => !props.find(prop => prop.fieldName === col.name));
+    const remove = columns.filter(col => !props.find(prop => prop.fieldNames.includes(col.name) || (prop.joinColumns || []).includes(col.name)));
 
     for (const prop of props) {
-      this.computeColumnDifference(table, create, prop, update);
+      this.computeColumnDifference(table, prop, create, update);
     }
 
     return { create, update, remove };
   }
 
-  private computeColumnDifference(table: DatabaseTable, create: EntityProperty[], prop: EntityProperty, update: { prop: EntityProperty; column: Column; diff: IsSame }[]): void {
-    const column = table.getColumn(prop.fieldName);
+  private computeColumnDifference(table: DatabaseTable, prop: EntityProperty, create: EntityProperty[], update: { prop: EntityProperty; column: Column; diff: IsSame }[], joinColumn?: string, idx = 0): void {
+    if ([ReferenceType.MANY_TO_ONE, ReferenceType.ONE_TO_ONE].includes(prop.reference) && !joinColumn) {
+      return prop.joinColumns.forEach((joinColumn, idx) => this.computeColumnDifference(table, prop, create, update, joinColumn, idx));
+    }
+
+    if (!joinColumn) {
+      return prop.fieldNames.forEach((fieldName, idx) => this.computeColumnDifference(table, prop, create, update, fieldName, idx));
+    }
+
+    const column = table.getColumn(joinColumn);
 
     if (!column) {
       create.push(prop);
       return;
     }
 
-    if (this.helper.supportsColumnAlter() && !this.helper.isSame(prop, column).all) {
-      const diff = this.helper.isSame(prop, column);
+    if (this.helper.supportsColumnAlter() && !this.helper.isSame(prop, column, idx).all) {
+      const diff = this.helper.isSame(prop, column, idx);
       update.push({ prop, column, diff });
     }
   }
@@ -270,22 +290,23 @@ export class SchemaGenerator {
     return [ReferenceType.SCALAR, ReferenceType.MANY_TO_ONE].includes(prop.reference) || (prop.reference === ReferenceType.ONE_TO_ONE && prop.owner);
   }
 
-  private createTableColumn(table: TableBuilder, meta: EntityMetadata, prop: EntityProperty, alter?: IsSame): ColumnBuilder {
+  private createTableColumn(table: TableBuilder, meta: EntityMetadata, prop: EntityProperty, pk?: string, idx = 0, alter?: IsSame): ColumnBuilder {
     if (prop.primary && !meta.compositePK && this.platform.isBigIntProperty(prop)) {
-      return table.bigIncrements(prop.fieldName);
+      return table.bigIncrements(prop.fieldNames[idx]);
     }
 
     if (prop.primary && !meta.compositePK && prop.type === 'number') {
-      return table.increments(prop.fieldName);
+      return table.increments(prop.fieldNames[idx]);
     }
 
     if (prop.enum && prop.items && prop.items.every(item => Utils.isString(item))) {
-      const col = table.enum(prop.fieldName, prop.items!);
-      return this.configureColumn(meta, prop, col, alter);
+      const col = table.enum(prop.fieldNames[idx], prop.items!);
+      return this.configureColumn(meta, prop, col, undefined, alter);
     }
 
-    const col = table.specificType(prop.fieldName, prop.columnType);
-    return this.configureColumn(meta, prop, col, alter);
+    const columnName = pk && prop.joinColumns ? prop.joinColumns[idx] : prop.fieldNames[idx];
+    const col = table.specificType(columnName, prop.columnTypes[idx]);
+    return this.configureColumn(meta, prop, col, meta.properties[pk!], alter);
   }
 
   private updateTableColumn(table: TableBuilder, meta: EntityMetadata, prop: EntityProperty, column: Column, diff: IsSame): void {
@@ -303,7 +324,7 @@ export class SchemaGenerator {
       return this.createForeignKey(table, meta, prop, diff);
     }
 
-    this.createTableColumn(table, meta, prop, diff).alter();
+    this.createTableColumn(table, meta, prop, undefined, undefined, diff).alter();
   }
 
   private dropTableColumn(table: TableBuilder, column: Column): void {
@@ -315,10 +336,10 @@ export class SchemaGenerator {
     table.dropColumn(column.name);
   }
 
-  private configureColumn(meta: EntityMetadata, prop: EntityProperty, col: ColumnBuilder, alter?: IsSame) {
+  private configureColumn(meta: EntityMetadata, prop: EntityProperty, col: ColumnBuilder, pkProp?: EntityProperty, alter?: IsSame) {
     const nullable = (alter && this.platform.requiresNullableForAlteringColumn()) || prop.nullable!;
     const indexed = 'index' in prop ? prop.index : (prop.reference !== ReferenceType.SCALAR && this.helper.indexForeignKeys());
-    const index = indexed && !(alter && alter.sameIndex);
+    const index = (indexed || (prop.primary && meta.compositePK)) && !(alter && alter.sameIndex);
     const indexName = Utils.isString(prop.index) ? prop.index : undefined;
     const uniqueName = Utils.isString(prop.unique) ? prop.unique : undefined;
     const hasDefault = typeof prop.default !== 'undefined'; // support falsy default values like `0`, `false` or empty string
@@ -326,7 +347,7 @@ export class SchemaGenerator {
     Utils.runIfNotEmpty(() => col.nullable(), nullable);
     Utils.runIfNotEmpty(() => col.notNullable(), !nullable);
     Utils.runIfNotEmpty(() => col.primary(), prop.primary && !meta.compositePK);
-    Utils.runIfNotEmpty(() => col.unsigned(), prop.unsigned);
+    Utils.runIfNotEmpty(() => col.unsigned(), (pkProp || prop).unsigned);
     Utils.runIfNotEmpty(() => col.index(indexName), index);
     Utils.runIfNotEmpty(() => col.unique(uniqueName), prop.unique);
     Utils.runIfNotEmpty(() => col.defaultTo(this.knex.raw('' + prop.default)), hasDefault);
@@ -342,13 +363,13 @@ export class SchemaGenerator {
 
   private createForeignKey(table: TableBuilder, meta: EntityMetadata, prop: EntityProperty, diff: IsSame = {}): void {
     if (this.helper.supportsSchemaConstraints()) {
-      this.createForeignKeyReference(table.foreign(prop.fieldName) as ColumnBuilder, prop);
+      this.createForeignKeyReference(table, prop);
 
       return;
     }
 
     if (!meta.pivotTable) {
-      this.createTableColumn(table, meta, prop, diff);
+      this.createTableColumn(table, meta, prop, undefined, undefined, diff);
     }
 
     // knex does not allow adding new columns with FK in sqlite
@@ -357,34 +378,41 @@ export class SchemaGenerator {
     // this.createForeignKeyReference(col, prop);
   }
 
-  private createForeignKeyReference(col: ColumnBuilder, prop: EntityProperty): void {
+  private createForeignKeyReference(table: TableBuilder, prop: EntityProperty): void {
     const meta2 = this.metadata.get(prop.type);
-    const pk2 = meta2.properties[meta2.primaryKey];
-    col.references(pk2.fieldName).inTable(meta2.collection);
     const cascade = prop.cascade.includes(Cascade.REMOVE) || prop.cascade.includes(Cascade.ALL);
 
-    if (prop.onDelete || cascade || prop.nullable) {
-      col.onDelete(prop.onDelete || (cascade ? 'cascade' : 'set null'));
-    }
+    meta2.primaryKeys.forEach((primaryKey, idx) => {
+      const pk2 = meta2.properties[primaryKey];
+      pk2.fieldNames.forEach(fieldName => {
+        const col = table.foreign(prop.fieldNames[idx]).references(fieldName).inTable(meta2.collection);
 
-    if (prop.onUpdateIntegrity || prop.cascade.includes(Cascade.PERSIST) || prop.cascade.includes(Cascade.ALL)) {
-      col.onUpdate(prop.onUpdateIntegrity || 'cascade');
-    }
+        if (prop.onDelete || cascade || prop.nullable) {
+          col.onDelete(prop.onDelete || (cascade ? 'cascade' : 'set null'));
+        }
+
+        if (prop.onUpdateIntegrity || prop.cascade.includes(Cascade.PERSIST) || prop.cascade.includes(Cascade.ALL)) {
+          col.onUpdate(prop.onUpdateIntegrity || 'cascade');
+        }
+      });
+    });
   }
 
   private findRenamedColumns(create: EntityProperty[], remove: Column[]): { from: Column; to: EntityProperty }[] {
     const renamed: { from: Column; to: EntityProperty }[] = [];
 
     for (const prop of create) {
-      const match = remove.find(column => {
-        const copy = Utils.copy(column);
-        copy.name = prop.fieldName;
+      for (const fieldName of prop.fieldNames) {
+        const match = remove.find(column => {
+          const copy = Utils.copy(column);
+          copy.name = fieldName;
 
-        return this.helper.isSame(prop, copy).all;
-      });
+          return this.helper.isSame(prop, copy).all;
+        });
 
-      if (match) {
-        renamed.push({ from: match, to: prop });
+        if (match) {
+          renamed.push({ from: match, to: prop });
+        }
       }
     }
 

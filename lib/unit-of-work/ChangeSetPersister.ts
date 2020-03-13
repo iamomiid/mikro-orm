@@ -2,7 +2,7 @@ import { MetadataStorage } from '../metadata';
 import { AnyEntity, Dictionary, EntityMetadata, EntityProperty, IPrimaryKey } from '../typings';
 import { EntityIdentifier, wrap } from '../entity';
 import { ChangeSet, ChangeSetType } from './ChangeSet';
-import { FilterQuery, IDatabaseDriver, Transaction } from '..';
+import { FilterQuery, IDatabaseDriver, Transaction, Utils } from '..';
 import { QueryResult } from '../connections';
 import { ValidationError } from '../utils';
 
@@ -54,7 +54,7 @@ export class ChangeSetPersister {
     }
 
     const cond = {
-      [changeSet.entity.__meta.primaryKey]: changeSet.entity.__primaryKey,
+      ...Utils.getPrimaryKeyCond<T>(changeSet.entity, meta.primaryKeys),
       [meta.versionProperty]: changeSet.entity[meta.versionProperty],
     } as FilterQuery<T>;
 
@@ -91,8 +91,8 @@ export class ChangeSetPersister {
   private mapReturnedValues<T extends AnyEntity<T>>(entity: T, res: QueryResult, meta: EntityMetadata<T>): void {
     if (res.row && Object.keys(res.row).length > 0) {
       Object.values<EntityProperty>(meta.properties).forEach(prop => {
-        if (res.row![prop.fieldName]) {
-          entity[prop.name as keyof T] = res.row![prop.fieldName] as T[keyof T];
+        if (prop.fieldNames && res.row![prop.fieldNames[0]]) { // FIXME
+          entity[prop.name as keyof T] = res.row![prop.fieldNames[0]] as T[keyof T]; // FIXME
         }
       });
     }

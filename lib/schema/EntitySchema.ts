@@ -210,6 +210,7 @@ export class EntitySchema<T extends AnyEntity<T> = AnyEntity, U extends AnyEntit
     const pks = Object.values<EntityProperty<T>>(this._meta.properties).filter(prop => prop.primary);
 
     if (pks.length > 0) {
+      // noinspection JSDeprecatedSymbols
       this._meta.primaryKey = pks[0].name;
       this._meta.primaryKeys = pks.map(prop => prop.name);
       this._meta.compositePK = pks.length > 1;
